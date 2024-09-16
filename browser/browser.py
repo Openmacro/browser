@@ -2,72 +2,23 @@ import asyncio
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
-from markdownify import markdownify as md
-from bs4 import BeautifulSoup
-
 from pathlib import Path 
+from .utils.general import to_markdown, get_relevant, uid
 from snova import SnSdk
 import importlib
 import browsers
 import random
 import json
 import toml
-import re
-
-
-# might publish as a new module
-def filter_markdown(markdown):
-    filtered_lines = []
-    consecutive_new_lines = 0
-    rendered  = re.compile(r'.*\]\(http.*\)')
-    embed_line = re.compile(r'.*\]\(.*\)')
-
-    for line in markdown.split('\n'):
-        line: str = line.strip()
-        
-        if embed_line.match(line) and not rendered.match(line):
-            continue
-        
-        if '[' in line and ']' not in line:
-            line = line.replace('[', '')
-        elif ']' in line and '[' not in line:
-            line = line.replace(']', '')
-        
-        if len(line) > 2:
-            filtered_lines.append(line)
-            consecutive_new_lines = 0
-        elif line == '' and consecutive_new_lines < 1:
-            filtered_lines.append('')
-            consecutive_new_lines += 1
-    
-    return '\n'.join(filtered_lines)
-
-def to_markdown(html, ignore=[], ignore_ids=[], ignore_classes=[], strip=[]): 
-    #html = html.encode('utf-8', 'replace').decode('utf-8')
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # Remove elements based on tags
-    for tag in ignore:
-        for element in soup.find_all(tag):
-            element.decompose()
-    
-    # Remove elements based on IDs
-    for id_ in ignore_ids:
-        for element in soup.find_all(id=id_):
-            element.decompose()
-    
-    # Remove elements based on classes
-    for class_ in ignore_classes:
-        for element in soup.find_all(class_=class_):
-            element.decompose()
-    
-    markdown = filter_markdown(md(str(soup), strip=strip))
-    return markdown
 
 class Browser:
-    def __init__(self, headless=False):
+    def __init__(self, openmacro, headless=True):
         # Temp solution, loads widgets from ALL engines
         # Should only load widgets from chosen engine
+        
+        # points to current openmacro instance
+        self.openmacro = openmacro
+        #self.collection = openmacro.collection
 
         with open(Path(__file__).parent / "src" / "engines.json", "r") as f:
             self.engines = json.load(f)
@@ -169,20 +120,40 @@ class Browser:
         await page.close()
         return results
     
-    async def playwright_load(self, url, clean: bool = False):
+    async def playwright_load(self, url, clean: bool = False, to_context=False, void=False):
         page = await self.browser.new_page()
         await stealth_async(page)
         await page.goto(url) 
         
-        if clean:
-            body = await page.query_selector('body')
-            html = await body.inner_html() 
+        if not clean:
+            return await page.content()
+        
+        body = await page.query_selector('body')
+        html = await body.inner_html() 
+        
+        contents = to_markdown(html, 
+                                ignore=['header', 'footer', 'nav', 'navbar'],
+                                ignore_classes=['footer']).strip()
             
-            contents = to_markdown(html, 
-                                   ignore=['header', 'footer', 'nav', 'navbar'],
-                                   ignore_classes=['footer']).strip()
+        # CONCEPT
+        # add to short-term openmacro vectordb 
+        # acts like a cache and local search engine
+        # for previous web searches
+        # uses embeddings to view relevant searches
+        if to_context:
+            # temp, will improve
+            contents = contents.split("###")
+            self.openmacro.collection.add(
+                documents=contents,
+                metadatas=[{"source": "browser"} 
+                           for _ in range(len(contents))], # filter on these!
+                ids=[f"doc-{uid()}" 
+                     for _ in range(len(contents))], # unique for each doc
+            )
+        
+        if not void:
             return contents
-        return await page.content()
+
 
     def search(self,
                query: str,
@@ -195,10 +166,18 @@ class Browser:
         # versions to save money
         
         sites = self.loop.run_until_complete(self.playwright_search(query, n, engine))
-        results = self.parallel(*(self.playwright_load(url=site["link"], clean=True) for site in sites))
+        self.parallel(*(self.playwright_load(url=site["link"], 
+                                             clean=True, 
+                                             to_context=True, 
+                                             void=True)
+                        for site in sites))
+                    
+        relevant = get_relevant(self.openmacro.collection.query(query_texts=[query], 
+                                                                n_results=3),
+                                clean=True)
         
         prompt = self.settings["prompts"]["summarise"] + (self.settings["prompts"]["citations"] if cite else "")
-        result = self.llm.chat("\n\n".join(results), 
+        result = self.llm.chat(relevant, 
                                role="browser",
                                system=prompt)
         return result
@@ -225,10 +204,11 @@ class Browser:
             results = await function(self, page)
         
         await page.close() 
-        return results
+        return results if results else "Error: It seems like your query does not show any widgets."
     
-    def parallel(self, *funcs):
-        return self.loop.run_until_complete(self.run_parallel(*funcs))
+    def parallel(self, *funcs, void=False):
+        if not void:
+            return self.loop.run_until_complete(self.run_parallel(*funcs)) 
         
     async def run_parallel(self, *funcs):
         return tuple(await asyncio.gather(*funcs))
